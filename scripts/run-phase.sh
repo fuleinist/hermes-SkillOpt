@@ -1003,8 +1003,10 @@ run_merge() {
         VAL_DIR="$validation_dir" \
         SNAPSHOTS_DIR="$snapshots_dir" \
         STATE_DIR="$STATE_DIR" \
+        TEST_SUITE="$TEST_SUITE" \
+        HERMES="$HERMES" \
         python3 << 'PYEOF'
-import glob, json, os
+import glob, json, os, shlex, subprocess, tempfile, time
 from datetime import datetime, timezone
 
 epoch = os.environ["EPOCH"]
@@ -1012,6 +1014,8 @@ target = os.environ["TARGET_PATH"]
 val_dir = os.environ["VAL_DIR"]
 snapshots_dir = os.environ["SNAPSHOTS_DIR"]
 state_dir = os.environ["STATE_DIR"]
+test_suite_path = os.environ.get("TEST_SUITE", "")
+hermes = os.environ.get("HERMES", "hermes")
 
 for name, value in {
     "TARGET_PATH": target,
@@ -1067,6 +1071,74 @@ def apply_edit(skill, proposal):
         return skill.replace(old_text, "", 1), None
     return skill, f"unknown edit type: {edit_type}"
 
+# ── Post-merge cumulative validation helpers ──────────────────────
+
+def run_post_merge_task(merged_skill, task):
+    """Run a single validation task against the merged skill via hermes -z."""
+    task_inst = task.get("instruction", "")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md",
+                                      prefix="skillopt-postmerge-", delete=False) as f:
+        f.write(merged_skill)
+        skill_tmp = f.name
+    try:
+        started = time.monotonic()
+        prompt = f"""Evaluate this skill document against the following task.
+
+=== SKILL DOCUMENT PATH ===
+{skill_tmp}
+
+Read the skill document from this path before evaluating. Do not modify the skill file.
+
+=== TASK ===
+{task_inst}
+
+Does this skill successfully handle this task? Respond with ONLY a JSON object:
+{{"pass": true/false, "quality_score": 0.0-1.0, "reason": "brief explanation"}}"""
+        cmd = shlex.split(hermes) + ["-z", prompt]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        duration = time.monotonic() - started
+        if result.returncode != 0:
+            return {"pass": False, "quality_score": 0.0, "duration_seconds": duration,
+                    "reason": f"hermes -z failed with exit {result.returncode}"}
+        try:
+            verdict = json.loads((result.stdout or "").strip())
+        except json.JSONDecodeError:
+            return {"pass": False, "quality_score": 0.0, "duration_seconds": duration,
+                    "reason": "parse error"}
+        return {
+            "pass": bool(verdict.get("pass", False)),
+            "quality_score": max(0.0, min(1.0, float(verdict.get("quality_score", verdict.get("quality", 0))))),
+            "duration_seconds": duration,
+            "token_estimate": int((len(prompt) + len(merged_skill) + len(result.stdout or "") + 3) // 4),
+            "reason": str(verdict.get("reason", "")),
+        }
+    except Exception as exc:
+        return {"pass": False, "quality_score": 0.0, "duration_seconds": time.monotonic() - started,
+                "reason": f"execution error: {exc}"}
+    finally:
+        try:
+            os.unlink(skill_tmp)
+        except OSError:
+            pass
+
+
+def post_merge_metrics_from_details(details):
+    """Compute pass_rate, quality_score, speed_score, token_efficiency from task results."""
+    if not details:
+        return {"pass_rate": 0.0, "quality_score": 0.0, "speed_score": 0.0, "token_efficiency": 0.0}
+    passed = sum(1 for d in details if d.get("pass", False))
+    pass_rate = passed / len(details)
+    avg_quality = sum(d.get("quality_score", 0.0) for d in details) / len(details)
+    avg_duration = sum(d.get("duration_seconds", 0.0) for d in details) / len(details)
+    avg_tokens = sum(d.get("token_estimate", 0) for d in details) / len(details)
+    return {
+        "pass_rate": pass_rate,
+        "quality_score": avg_quality,
+        "speed_score": 1.0 / (1.0 + avg_duration),
+        "token_efficiency": 1.0 / (1.0 + (avg_tokens / 1000.0)),
+    }
+
+
 with open(target, encoding="utf-8") as f:
     skill = f.read()
 
@@ -1117,43 +1189,119 @@ with open(target, "w", encoding="utf-8") as f:
 print(f"  Merged: {accepted} edits, {rejected} rejected")
 print(f"  Snapshot saved: {snapshot}")
 
+# ── Post-merge cumulative validation ─────────────────────────────
+merge_reverted = False
+if test_suite_path and os.path.exists(test_suite_path):
+    try:
+        suite = load_json(test_suite_path)
+        val_tasks = suite.get("validation", [])
+    except Exception:
+        val_tasks = []
+    if val_tasks:
+        baseline_file = os.path.join(val_dir, "baseline.json")
+        if os.path.exists(baseline_file):
+            try:
+                baseline = load_json(baseline_file)
+                bm = baseline.get("baseline_metrics") or {}
+                weights = baseline.get("metric_weights",
+                    {"pass_rate": 0.55, "quality_score": 0.30,
+                     "speed_score": 0.10, "token_efficiency": 0.05})
+                bpr = float(bm.get("pass_rate", 0.0))
+                bsc = float(bm.get("weighted_score", bpr))
+            except Exception:
+                bpr, bsc = None, None
+
+            if bpr is not None:
+                with open(target, encoding="utf-8") as f:
+                    merged_skill = f.read()
+
+                details = []
+                for task in val_tasks:
+                    verdict = run_post_merge_task(merged_skill, task)
+                    details.append(verdict)
+
+                pm = post_merge_metrics_from_details(details)
+                mpr = pm["pass_rate"]
+                msc = (weights["pass_rate"] * pm["pass_rate"]
+                       + weights["quality_score"] * pm["quality_score"]
+                       + weights["speed_score"] * pm["speed_score"]
+                       + weights["token_efficiency"] * pm["token_efficiency"])
+
+                if mpr < bpr or msc < bsc:
+                    merge_reverted = True
+                    with open(snapshot, encoding="utf-8") as sf:
+                        with open(target, "w", encoding="utf-8") as tf:
+                            tf.write(sf.read())
+                    print(f"  ⚠ POST-MERGE VALIDATION FAILED: pass {bpr:.0%}→{mpr:.0%}, "
+                          f"score {bsc:.2f}→{msc:.2f}")
+                    print(f"  Reverted to snapshot: {snapshot}")
+                    diag = {"epoch": epoch, "pass_rate": round(mpr, 4),
+                            "weighted_score": round(msc, 4),
+                            "baseline_pass_rate": round(bpr, 4),
+                            "baseline_score": round(bsc, 4),
+                            "reverted": True, "snapshot": snapshot}
+                    diag_file = os.path.join(state_dir, "failed-merges.json")
+                    diag_buffer = load_json(diag_file) if os.path.exists(diag_file) else []
+                    diag_buffer.append(diag)
+                    write_json(diag_file, diag_buffer)
+                else:
+                    print(f"  ✓ Post-merge validation passed: pass {bpr:.0%}→{mpr:.0%}, "
+                          f"score {bsc:.2f}→{msc:.2f}")
+
 meta_file = os.path.join(state_dir, "board-metadata.json")
 meta = load_json(meta_file)
-meta["epoch"] = int(epoch) + 1
-meta["last_merged_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-write_json(meta_file, meta)
-print(f"  Epoch incremented to: {int(epoch) + 1}")
+if merge_reverted:
+    meta.setdefault("validation_metric_history", []).append({
+        "epoch": int(epoch),
+        "merge_reverted": True,
+        "pass_rate": round(mpr, 4),
+        "weighted_score": round(msc, 4),
+    })
+    write_json(meta_file, meta)
+    with open(os.path.join(state_dir, ".merge-reverted"), "w") as f:
+        f.write(f"epoch={epoch}\n")
+    print(f"  ⚠ Merge reverted — epoch not advanced.")
+else:
+    meta["epoch"] = int(epoch) + 1
+    meta["last_merged_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    write_json(meta_file, meta)
+    print(f"  Epoch incremented to: {int(epoch) + 1}")
 PYEOF
 
-        local next_epoch=$((EPOCH + 1))
+        if [[ -f "$STATE_DIR/.merge-reverted" ]]; then
+            rm -f "$STATE_DIR/.merge-reverted"
+            echo "  Review $STATE_DIR/failed-merges.json before retrying."
+            echo "  Next: run the merge phase again after addressing failures."
+        else
+            local next_epoch=$((EPOCH + 1))
 
-        local initial_budget
-        initial_budget=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
+            local initial_budget
+            initial_budget=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
 import json, sys
 meta = json.load(open(sys.argv[1]))
 initial = meta.get('initial_edit_budget', meta.get('edit_budget', 4))
 print(int(initial))
 PYEOF
 )
-        local budget_floor
-        budget_floor=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
+            local budget_floor
+            budget_floor=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
 import json, sys
 meta = json.load(open(sys.argv[1]))
 print(int(meta.get('budget_floor', 2)))
 PYEOF
 )
-        local max_epochs
-        max_epochs=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
+            local max_epochs
+            max_epochs=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
 import json, sys
 meta = json.load(open(sys.argv[1]))
 print(int(meta.get('max_epochs', 4)))
 PYEOF
 )
-        local new_budget
-        new_budget=$(compute_budget "$EPOCH" "$initial_budget" "$budget_floor" "$max_epochs")
+            local new_budget
+            new_budget=$(compute_budget "$EPOCH" "$initial_budget" "$budget_floor" "$max_epochs")
 
-        local plateau
-        plateau=$(NEW_BUDGET="$new_budget" python3 - "$STATE_DIR/board-metadata.json" "$validation_dir" "$EPOCH" << 'PYEOF'
+            local plateau
+            plateau=$(NEW_BUDGET="$new_budget" python3 - "$STATE_DIR/board-metadata.json" "$validation_dir" "$EPOCH" << 'PYEOF'
 import glob, json, os, sys
 
 meta_file, validation_dir, epoch_s = sys.argv[1:4]
@@ -1237,19 +1385,20 @@ else:
 PYEOF
 )
 
-        echo "  Budget for epoch $next_epoch: $new_budget edits"
-        if [[ "$EPOCH" -ge "$max_epochs" ]]; then
-            echo ""
-            echo "Epoch $EPOCH reached max epoch threshold ($max_epochs). Triggering slow-meta phase."
-            echo "Next: $0 --board $BOARD_SLUG --phase slow-meta --epoch $EPOCH"
-        elif [[ "$plateau" == "true" ]]; then
-            echo ""
-            echo "Validation metrics plateaued across the last 3 epochs. Triggering slow-meta phase."
-            echo "Next: $0 --board $BOARD_SLUG --phase slow-meta --epoch $EPOCH"
-        else
-            echo ""
-            echo "Next: $0 --board $BOARD_SLUG --phase rollout --epoch $next_epoch"
-        fi
+            echo "  Budget for epoch $next_epoch: $new_budget edits"
+            if [[ "$EPOCH" -ge "$max_epochs" ]]; then
+                echo ""
+                echo "Epoch $EPOCH reached max epoch threshold ($max_epochs). Triggering slow-meta phase."
+                echo "Next: $0 --board $BOARD_SLUG --phase slow-meta --epoch $EPOCH"
+            elif [[ "$plateau" == "true" ]]; then
+                echo ""
+                echo "Validation metrics plateaued across the last 3 epochs. Triggering slow-meta phase."
+                echo "Next: $0 --board $BOARD_SLUG --phase slow-meta --epoch $EPOCH"
+            else
+                echo ""
+                echo "Next: $0 --board $BOARD_SLUG --phase rollout --epoch $next_epoch"
+            fi
+    fi
     else
         echo "To merge, run with --exec or:"
         echo "  1. Apply each accepted edit from $validation_dir to $TARGET"
