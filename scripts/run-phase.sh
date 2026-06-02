@@ -1006,7 +1006,7 @@ run_merge() {
         TEST_SUITE="$TEST_SUITE" \
         HERMES="$HERMES" \
         python3 << 'PYEOF'
-import glob, json, os
+import glob, json, os, shlex, subprocess, tempfile, time
 from datetime import datetime, timezone
 
 epoch = os.environ["EPOCH"]
@@ -1075,7 +1075,6 @@ def apply_edit(skill, proposal):
 
 def run_post_merge_task(merged_skill, task):
     """Run a single validation task against the merged skill via hermes -z."""
-    import subprocess, shlex, tempfile, time
     task_inst = task.get("instruction", "")
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md",
                                       prefix="skillopt-postmerge-", delete=False) as f:
@@ -1191,6 +1190,7 @@ print(f"  Merged: {accepted} edits, {rejected} rejected")
 print(f"  Snapshot saved: {snapshot}")
 
 # ── Post-merge cumulative validation ─────────────────────────────
+merge_reverted = False
 if test_suite_path and os.path.exists(test_suite_path):
     try:
         suite = load_json(test_suite_path)
@@ -1228,6 +1228,7 @@ if test_suite_path and os.path.exists(test_suite_path):
                        + weights["token_efficiency"] * pm["token_efficiency"])
 
                 if mpr < bpr or msc < bsc:
+                    merge_reverted = True
                     with open(snapshot, encoding="utf-8") as sf:
                         with open(target, "w", encoding="utf-8") as tf:
                             tf.write(sf.read())
@@ -1249,15 +1250,32 @@ if test_suite_path and os.path.exists(test_suite_path):
 
 meta_file = os.path.join(state_dir, "board-metadata.json")
 meta = load_json(meta_file)
-meta["epoch"] = int(epoch) + 1
-meta["last_merged_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-write_json(meta_file, meta)
-print(f"  Epoch incremented to: {int(epoch) + 1}")
+if merge_reverted:
+    meta.setdefault("validation_metric_history", []).append({
+        "epoch": int(epoch),
+        "merge_reverted": True,
+        "pass_rate": round(mpr, 4),
+        "weighted_score": round(msc, 4),
+    })
+    write_json(meta_file, meta)
+    with open(os.path.join(state_dir, ".merge-reverted"), "w") as f:
+        f.write(f"epoch={epoch}\n")
+    print(f"  ⚠ Merge reverted — epoch not advanced.")
+else:
+    meta["epoch"] = int(epoch) + 1
+    meta["last_merged_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    write_json(meta_file, meta)
+    print(f"  Epoch incremented to: {int(epoch) + 1}")
 PYEOF
 
-        local next_epoch=$((EPOCH + 1))
+        if [[ -f "$STATE_DIR/.merge-reverted" ]]; then
+            rm -f "$STATE_DIR/.merge-reverted"
+            echo "  Review $STATE_DIR/failed-merges.json before retrying."
+            echo "  Next: run the merge phase again after addressing failures."
+        else
+            local next_epoch=$((EPOCH + 1))
 
-        local initial_budget
+            local initial_budget
         initial_budget=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
 import json, sys
 meta = json.load(open(sys.argv[1]))
@@ -1380,6 +1398,7 @@ PYEOF
             echo ""
             echo "Next: $0 --board $BOARD_SLUG --phase rollout --epoch $next_epoch"
         fi
+    fi
     else
         echo "To merge, run with --exec or:"
         echo "  1. Apply each accepted edit from $validation_dir to $TARGET"
