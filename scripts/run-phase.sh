@@ -1276,32 +1276,32 @@ PYEOF
             local next_epoch=$((EPOCH + 1))
 
             local initial_budget
-        initial_budget=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
+            initial_budget=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
 import json, sys
 meta = json.load(open(sys.argv[1]))
 initial = meta.get('initial_edit_budget', meta.get('edit_budget', 4))
 print(int(initial))
 PYEOF
 )
-        local budget_floor
-        budget_floor=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
+            local budget_floor
+            budget_floor=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
 import json, sys
 meta = json.load(open(sys.argv[1]))
 print(int(meta.get('budget_floor', 2)))
 PYEOF
 )
-        local max_epochs
-        max_epochs=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
+            local max_epochs
+            max_epochs=$(python3 - "$STATE_DIR/board-metadata.json" << 'PYEOF'
 import json, sys
 meta = json.load(open(sys.argv[1]))
 print(int(meta.get('max_epochs', 4)))
 PYEOF
 )
-        local new_budget
-        new_budget=$(compute_budget "$EPOCH" "$initial_budget" "$budget_floor" "$max_epochs")
+            local new_budget
+            new_budget=$(compute_budget "$EPOCH" "$initial_budget" "$budget_floor" "$max_epochs")
 
-        local plateau
-        plateau=$(NEW_BUDGET="$new_budget" python3 - "$STATE_DIR/board-metadata.json" "$validation_dir" "$EPOCH" << 'PYEOF'
+            local plateau
+            plateau=$(NEW_BUDGET="$new_budget" python3 - "$STATE_DIR/board-metadata.json" "$validation_dir" "$EPOCH" << 'PYEOF'
 import glob, json, os, sys
 
 meta_file, validation_dir, epoch_s = sys.argv[1:4]
@@ -1385,19 +1385,19 @@ else:
 PYEOF
 )
 
-        echo "  Budget for epoch $next_epoch: $new_budget edits"
-        if [[ "$EPOCH" -ge "$max_epochs" ]]; then
-            echo ""
-            echo "Epoch $EPOCH reached max epoch threshold ($max_epochs). Triggering slow-meta phase."
-            echo "Next: $0 --board $BOARD_SLUG --phase slow-meta --epoch $EPOCH"
-        elif [[ "$plateau" == "true" ]]; then
-            echo ""
-            echo "Validation metrics plateaued across the last 3 epochs. Triggering slow-meta phase."
-            echo "Next: $0 --board $BOARD_SLUG --phase slow-meta --epoch $EPOCH"
-        else
-            echo ""
-            echo "Next: $0 --board $BOARD_SLUG --phase rollout --epoch $next_epoch"
-        fi
+            echo "  Budget for epoch $next_epoch: $new_budget edits"
+            if [[ "$EPOCH" -ge "$max_epochs" ]]; then
+                echo ""
+                echo "Epoch $EPOCH reached max epoch threshold ($max_epochs). Triggering slow-meta phase."
+                echo "Next: $0 --board $BOARD_SLUG --phase slow-meta --epoch $EPOCH"
+            elif [[ "$plateau" == "true" ]]; then
+                echo ""
+                echo "Validation metrics plateaued across the last 3 epochs. Triggering slow-meta phase."
+                echo "Next: $0 --board $BOARD_SLUG --phase slow-meta --epoch $EPOCH"
+            else
+                echo ""
+                echo "Next: $0 --board $BOARD_SLUG --phase rollout --epoch $next_epoch"
+            fi
     fi
     else
         echo "To merge, run with --exec or:"
