@@ -1259,7 +1259,7 @@ Does this skill successfully handle this task? Respond with ONLY a JSON object:
             "pass": bool(verdict.get("pass", False)),
             "quality_score": max(0.0, min(1.0, float(verdict.get("quality_score", verdict.get("quality", 0))))),
             "duration_seconds": duration,
-            "token_estimate": int((len(prompt) + len(merged_skill) + len(result.stdout or "") + 3) // 4),
+            "token_estimate": int((len(prompt) + len(merged_skill) + len(result.stdout or "") + len(result.stderr or "") + 3) // 4),
             "reason": str(verdict.get("reason", "")),
         }
     except Exception as exc:
