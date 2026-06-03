@@ -1,7 +1,7 @@
 ---
 name: skillopt
 description: Run controlled skill optimization cycles on any skill document. Uses kanban-based pipelines with validation gates — the methodology from Microsoft Research's SkillOpt (arXiv 2605.23904).
-version: 1.0.0-alpha
+version: 1.1.0
 author: Jasper (on behalf of Magnus Hedemark)
 license: MIT
 compatibility: Hermes Agent only — uses hermes kanban and hermes -z/--oneshot — not compatible with Claude Code, Copilot, OpenCode, or Cursor
