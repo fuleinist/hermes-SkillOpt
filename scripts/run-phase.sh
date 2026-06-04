@@ -248,6 +248,26 @@ print(f'    Wrote: {output_file}')
         shopt -u nullglob
         echo ""
         echo "Rollout complete: $completed records written."
+
+        # Copy rollouts to unified pyramid and regenerate root files
+        local dossiers_dir="$STATE_DIR/03-dossiers"
+        mkdir -p "$dossiers_dir"
+        shopt -s nullglob
+        for rf in "$rollout_dir"/epoch-"$EPOCH"-*.json; do
+            local rbase
+            rbase=$(basename "$rf")
+            local rdest="$dossiers_dir/$(echo "$rbase" | sed "s/^epoch-${EPOCH}-/epoch-${EPOCH}-rollout-/")"
+            cp "$rf" "$rdest"
+        done
+        shopt -u nullglob
+        SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)" PYTHONPATH="$SCRIPTS_DIR:$PYTHONPATH" \
+            EPOCH="$EPOCH" STATE_DIR="$STATE_DIR" python3 << 'PYEOF'
+import os, sys
+import pyramid_utils
+state_dir = os.environ["STATE_DIR"]
+epoch = os.environ["EPOCH"]
+pyramid_utils.update_root_pyramid(state_dir, epoch)
+PYEOF
     else
         # Print guidance
         echo "To execute rollouts, run with --exec or run the following for each task:"
@@ -269,6 +289,8 @@ print(f'    Wrote: {output_file}')
         echo ""
         echo "After completing all rollouts, run:"
         echo "  $0 --board $BOARD_SLUG --phase reflect --epoch $EPOCH"
+        echo ""
+        echo "Output: 03-dossiers/epoch-EPOCH-rollout-*.json"
     fi
 }
 
@@ -281,8 +303,14 @@ run_reflect() {
     mkdir -p "$reflect_dir"
 
     local rollout_files=()
+    # Check unified pyramid first, fall back to old directory
+    local rollout_source="$STATE_DIR/03-dossiers"
     shopt -s nullglob
-    rollout_files=("$rollout_dir"/epoch-"$EPOCH"-*.json)
+    rollout_files=("$rollout_source"/epoch-"$EPOCH"-rollout-*.json)
+    if [[ ${#rollout_files[@]} -eq 0 ]]; then
+        rollout_source="$STATE_DIR/rollouts"
+        rollout_files=("$rollout_source"/epoch-"$EPOCH"-*.json)
+    fi
     shopt -u nullglob
     if [[ ${#rollout_files[@]} -eq 0 ]]; then
         echo "ERROR: No rollout records found for epoch $EPOCH."
@@ -297,11 +325,17 @@ run_reflect() {
 
     if [[ "$EXEC" == true ]]; then
         # Aggregate rollouts into a reflection prompt
+        local rollout_glob
+        if [[ "$rollout_source" == "$STATE_DIR/03-dossiers" ]]; then
+            rollout_glob="$rollout_source/epoch-$EPOCH-rollout-*.json"
+        else
+            rollout_glob="$rollout_source/epoch-$EPOCH-*.json"
+        fi
         local rollouts_json
-        rollouts_json=$(python3 -c "
-import json, glob
+        ROLLOUT_GLOB="$rollout_glob" python3 -c "
+import json, glob, os
 records = []
-for f in sorted(glob.glob('$rollout_dir/epoch-$EPOCH-*.json')):
+for f in sorted(glob.glob(os.environ['ROLLOUT_GLOB'])):
     records.append(json.load(open(f)))
 print(json.dumps(records, indent=2))
 ")
@@ -349,6 +383,13 @@ except Exception:
 open('$reflect_dir/epoch-$EPOCH.json', 'w').write(json.dumps(data, indent=2))
 print(f'  Reflection written: $reflect_dir/epoch-$EPOCH.json')
 "
+        # Copy reflection to unified pyramid and regenerate root files
+        cp "$reflect_dir/epoch-$EPOCH.json" "$STATE_DIR/03-dossiers/epoch-$EPOCH-reflection.json"
+        SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)" PYTHONPATH="$SCRIPTS_DIR:$PYTHONPATH" \
+            EPOCH="$EPOCH" STATE_DIR="$STATE_DIR" python3 << 'PYEOF'
+import os, sys; import pyramid_utils
+pyramid_utils.update_root_pyramid(os.environ["STATE_DIR"], os.environ["EPOCH"])
+PYEOF
     else
         echo "To generate a reflection, run with --exec or:"
         echo "  $HERMES -z \"Review the rollout records in \$SKILLOPT_DIR/$SKILL_NAME/rollouts/ and produce a structured reflection\""
@@ -370,7 +411,12 @@ run_propose() {
     local proposal_dir="$STATE_DIR/proposals"
     mkdir -p "$proposal_dir"
 
-    if [[ ! -f "$reflect_dir/epoch-$EPOCH.json" ]]; then
+    # Check unified pyramid first for reflection, fall back to old directory
+    local reflect_file="$STATE_DIR/03-dossiers/epoch-$EPOCH-reflection.json"
+    if [[ ! -f "$reflect_file" ]]; then
+        reflect_file="$reflect_dir/epoch-$EPOCH.json"
+    fi
+    if [[ ! -f "$reflect_file" ]]; then
         echo "ERROR: No reflection document found for epoch $EPOCH."
         echo "Run reflect phase first."
         exit 1
@@ -381,7 +427,7 @@ run_propose() {
 
     if [[ "$EXEC" == true ]]; then
         local reflection
-        reflection=$(cat "$reflect_dir/epoch-$EPOCH.json")
+        reflection=$(cat "$reflect_file")
 
         local prompt="You are proposing edits to improve a skill document based on rollout analysis.
 
@@ -427,6 +473,13 @@ open('$proposal_dir/epoch-$EPOCH.json', 'w').write(json.dumps(data, indent=2))
 proposals = data.get('proposals', [])
 print(f'  Proposals written: $proposal_dir/epoch-$EPOCH.json ({len(proposals)} edits)')
 "
+        # Copy proposals to unified pyramid and regenerate root files
+        cp "$proposal_dir/epoch-$EPOCH.json" "$STATE_DIR/03-dossiers/epoch-$EPOCH-proposals.json"
+        SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)" PYTHONPATH="$SCRIPTS_DIR:$PYTHONPATH" \
+            EPOCH="$EPOCH" STATE_DIR="$STATE_DIR" python3 << 'PYEOF'
+import os, sys; import pyramid_utils
+pyramid_utils.update_root_pyramid(os.environ["STATE_DIR"], os.environ["EPOCH"])
+PYEOF
     else
         echo "To generate proposals, run with --exec or manually craft up to $EDIT_BUDGET edits."
         echo ""
@@ -499,8 +552,12 @@ proposal_file = os.environ["PROPOSAL_FILE"]
 test_suite = os.environ["TEST_SUITE"]
 val_dir = os.environ["VAL_DIR"]
 hermes = os.environ.get("HERMES", "hermes")
-baseline_file = os.path.join(val_dir, "baseline.json")
 state_dir = os.path.dirname(val_dir)
+baseline_dir = os.path.join(state_dir, "baseline", f"epoch-{epoch}")
+baseline_index = os.path.join(baseline_dir, "00-index.md")
+baseline_summary = os.path.join(baseline_dir, "01-summary", "findings.md")
+baseline_analysis = os.path.join(baseline_dir, "02-analysis", "per-task-evaluation.md")
+baseline_dossiers = os.path.join(baseline_dir, "03-dossiers")
 metadata_file = os.path.join(state_dir, "board-metadata.json")
 
 def load_json(path):
@@ -843,22 +900,52 @@ def baseline_has_required_metrics(metrics):
     return isinstance(metrics, dict) and REQUIRED_METRIC_FIELDS.issubset(metrics.keys())
 
 def load_or_create_baseline(skill_content, val_tasks):
-    if os.path.exists(baseline_file):
-        baseline = load_json(baseline_file)
-        metrics = baseline.get("baseline_metrics") or baseline.get("metrics")
-        if baseline.get("validation_context") != VALIDATION_CONTEXT:
+    # Check for existing baseline in unified pyramid (03-dossiers) first,
+    # then fall back to old-format pyramid (baseline/epoch-N/00-index.md)
+    dossiers_dir = os.path.join(state_dir, "03-dossiers")
+    dossier_path = os.path.join(dossiers_dir, f"epoch-{epoch}-baseline.json")
+    cached = None
+    if os.path.exists(dossier_path):
+        cached = load_json(dossier_path)
+    elif os.path.exists(baseline_index):
+        # Old-format baseline pyramid — read from 01-summary YAML frontmatter
+        try:
+            summary_text = open(baseline_summary).read()
+            meta = json.loads(summary_text.split("---", 2)[1])
+            metrics = {k: meta[k] for k in ("pass_rate", "avg_quality_score", "avg_duration_seconds",
+                                             "avg_token_estimate", "speed_score", "token_efficiency",
+                                             "weighted_score", "tasks_passed", "tasks_failed",
+                                             "total_duration_seconds", "total_token_estimate")}
+            details = []
+            if os.path.isdir(baseline_dossiers):
+                for fname in sorted(os.listdir(baseline_dossiers)):
+                    if fname.endswith(".json"):
+                        details.append(load_json(os.path.join(baseline_dossiers, fname)))
+            cached = {
+                "epoch": int(epoch), "target": target,
+                "validation_context": meta.get("validation_context", ""),
+                "validation_tasks_run": meta.get("total_tasks", 0),
+                "metric_weights": meta.get("metric_weights", {}),
+                "baseline_metrics": metrics, "validation_detail": details,
+                "created_at": meta.get("created_at", ""),
+            }
+        except:
+            cached = None
+
+    if cached:
+        metrics = cached.get("baseline_metrics") or {}
+        ctx = cached.get("validation_context", "")
+        if ctx != VALIDATION_CONTEXT:
             print("  Existing baseline uses old validation context; recomputing baseline.")
         elif baseline_has_required_metrics(metrics):
-            print(
-                f"  Baseline loaded: {baseline_file} "
-                f"(pass: {float(metrics.get('pass_rate', 0.0)):.0%}, "
-                f"quality: {float(metrics.get('avg_quality_score', 0.0)):.2f}, "
-                f"score: {float(metrics.get('weighted_score', 0.0)):.2f})"
-            )
-            return baseline, metrics
+            print(f"  Baseline loaded (pass: {float(metrics.get('pass_rate', 0.0)):.0%}, "
+                  f"quality: {float(metrics.get('avg_quality_score', 0.0)):.2f}, "
+                  f"score: {float(metrics.get('weighted_score', 0.0)):.2f})")
+            return cached, metrics
         else:
             print("  Existing baseline lacks multi-objective metrics; recomputing baseline.")
 
+    # --- Cache miss / recompute ---
     details = []
     for task in val_tasks:
         task_id = task.get("id", "unknown")
@@ -866,24 +953,27 @@ def load_or_create_baseline(skill_content, val_tasks):
         details.append({"task_id": task_id, "result": verdict})
 
     metrics = metrics_from_details(details, metric_weights)
-    baseline = {
-        "epoch": int(epoch),
-        "target": target,
+    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    baseline_json = {
+        "epoch": int(epoch), "target": target,
         "validation_context": VALIDATION_CONTEXT,
         "validation_tasks_run": len(val_tasks),
         "metric_weights": metric_weights,
         "baseline_metrics": metrics,
         "validation_detail": details,
-        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        "created_at": created_at,
     }
-    write_json(baseline_file, baseline)
-    print(
-        f"  Baseline written: {baseline_file} "
-        f"(pass: {float(metrics.get('pass_rate', 0.0)):.0%}, "
-        f"quality: {float(metrics.get('avg_quality_score', 0.0)):.2f}, "
-        f"score: {float(metrics.get('weighted_score', 0.0)):.2f})"
-    )
-    return baseline, metrics
+
+    # Write to unified pyramid dossiers
+    os.makedirs(dossiers_dir, exist_ok=True)
+    write_json(dossier_path, baseline_json)
+    pyramid_utils.update_root_pyramid(state_dir, epoch)
+
+    print(f"  Baseline written: {dossier_path} "
+          f"(pass: {float(metrics.get('pass_rate', 0.0)):.0%}, "
+          f"quality: {float(metrics.get('avg_quality_score', 0.0)):.2f}, "
+          f"score: {float(metrics.get('weighted_score', 0.0)):.2f})")
+    return baseline_json, metrics
 
 def apply_edit(skill_content, edit):
     edit_type = edit.get("type", "replace")
@@ -907,6 +997,13 @@ def apply_edit(skill_content, edit):
             return skill_content, "delete edit old_text not found"
         return skill_content.replace(old_text, "", 1), None
     return skill_content, f"unknown edit type: {edit_type}"
+
+
+# Load shared pyramid utilities
+_scripts_dir = os.path.join(os.path.dirname(os.path.dirname(val_dir)), "scripts")
+sys.path.insert(0, _scripts_dir)
+import pyramid_utils
+
 
 proposals = load_json(proposal_file)
 with open(target, encoding="utf-8") as f:
@@ -1044,6 +1141,18 @@ if rejected > 0:
         new_rejections.append(result)
     write_json(buffer_file, buffer)
     print(f"  Rejected edits appended to: {buffer_file} ({len(new_rejections)} new)")
+
+# --- Write validation dossiers to unified pyramid ---
+dossiers_dir_val = os.path.join(state_dir, "03-dossiers")
+os.makedirs(dossiers_dir_val, exist_ok=True)
+for r in results:
+    src = os.path.join(val_dir, f"epoch-{epoch}-{r['proposal_id']}.json")
+    dst = os.path.join(dossiers_dir_val, f"epoch-{epoch}-validation-{r['proposal_id']}.json")
+    if os.path.exists(src):
+        import shutil
+        shutil.copy2(src, dst)
+pyramid_utils.update_root_pyramid(state_dir, epoch)
+print(f"  Validation dossiers written to 03-dossiers/ ({len(results)} edits)")
 PYEOF
     else
         echo "To run validation, use --exec or:"
@@ -1053,7 +1162,7 @@ PYEOF
         echo "  4. Compare results against baseline"
         echo ""
         echo "Input: $proposal_dir/epoch-$EPOCH.json"
-        echo "Output: $validation_dir/epoch-$EPOCH-*.json"
+        echo "Output: $validation_dir/ -> 03-dossiers/epoch-EPOCH-validation-*.json"
         echo "See references/artifact-formats.md for validation result schema."
         echo ""
         echo "After validation, run:"
@@ -1259,7 +1368,7 @@ Does this skill successfully handle this task? Respond with ONLY a JSON object:
             "pass": bool(verdict.get("pass", False)),
             "quality_score": max(0.0, min(1.0, float(verdict.get("quality_score", verdict.get("quality", 0))))),
             "duration_seconds": duration,
-            "token_estimate": int((len(prompt) + len(merged_skill) + len(result.stdout or "") + 3) // 4),
+            "token_estimate": int((len(prompt) + len(merged_skill) + len(result.stdout or "") + len(result.stderr or "") + 3) // 4),
             "reason": str(verdict.get("reason", "")),
         }
     except Exception as exc:
@@ -1335,7 +1444,15 @@ proposals_by_id = {p.get("id"): p for p in proposals.get("proposals", [])}
 
 accepted = 0
 rejected = 0
-for result_file in sorted(glob.glob(os.path.join(val_dir, f"epoch-{epoch}-*.json"))):
+
+# Try reading from unified pyramid dossiers first, fall back to flat glob
+dossiers_dir_m = os.path.join(state_dir, "03-dossiers")
+result_files = sorted(glob.glob(os.path.join(dossiers_dir_m, f"epoch-{epoch}-validation-*.json")))
+if not result_files:
+    # Old-format: flat validation-results/ directory
+    result_files = sorted(glob.glob(os.path.join(val_dir, f"epoch-{epoch}-*.json")))
+
+for result_file in result_files:
     result = load_json(result_file)
     if result.get("verdict") != "accepted":
         rejected += 1
@@ -1379,10 +1496,37 @@ if test_suite_path and os.path.exists(test_suite_path):
     except Exception:
         val_tasks = []
     if val_tasks:
-        baseline_file = os.path.join(val_dir, "baseline.json")
-        if os.path.exists(baseline_file):
+        # Derive artifact-pyramid baseline paths (same layout as validate phase)
+        _baseline_dir = os.path.join(os.path.dirname(val_dir), "baseline", f"epoch-{epoch}")
+        _baseline_index = os.path.join(_baseline_dir, "00-index.md")
+        _baseline_summary = os.path.join(_baseline_dir, "01-summary", "findings.md")
+        _baseline_dossiers = os.path.join(_baseline_dir, "03-dossiers")
+        _baseline_json = os.path.join(_baseline_dir, "baseline.json")
+        if os.path.exists(_baseline_index) or os.path.exists(_baseline_json):
             try:
-                baseline = load_json(baseline_file)
+                _source = _baseline_json if os.path.exists(_baseline_json) else _baseline_index
+                if _source == _baseline_json:
+                    baseline = load_json(_baseline_json)
+                else:
+                    summary_text = open(_baseline_summary).read()
+                    meta = json.loads(summary_text.split("---", 2)[1])
+                    # Load per-task details from L3 dossiers
+                    details = []
+                    if os.path.isdir(_baseline_dossiers):
+                        for fname in sorted(os.listdir(_baseline_dossiers)):
+                            if fname.endswith(".json"):
+                                details.append(load_json(os.path.join(_baseline_dossiers, fname)))
+                    baseline = {
+                        "epoch": int(epoch),
+                        "target": target,
+                        "validation_context": meta.get("validation_context", ""),
+                        "validation_tasks_run": meta.get("total_tasks", 0),
+                        "metric_weights": meta.get("metric_weights", {}),
+                        "baseline_metrics": {k: meta[k] for k in ("pass_rate", "avg_quality_score",
+                                             "weighted_score", "tasks_passed", "tasks_failed")},
+                        "validation_detail": details,
+                        "created_at": meta.get("created_at", ""),
+                    }
                 bm = baseline.get("baseline_metrics") or {}
                 weights = baseline.get("metric_weights", DEFAULT_METRIC_WEIGHTS)
                 bpr = float(bm.get("pass_rate", 0.0))
@@ -1424,8 +1568,9 @@ if test_suite_path and os.path.exists(test_suite_path):
                     diag_buffer.append(diag)
                     write_json(diag_file, diag_buffer)
                 else:
-                    refreshed_baseline = {
-                        "epoch": int(epoch) + 1,
+                    next_epoch = int(epoch) + 1
+                    refreshed_baseline_json = {
+                        "epoch": next_epoch,
                         "target": target,
                         "validation_context": VALIDATION_CONTEXT,
                         "validation_tasks_run": len(val_tasks),
@@ -1436,10 +1581,89 @@ if test_suite_path and os.path.exists(test_suite_path):
                         "refreshed_from_epoch": int(epoch),
                         "source": "post_merge_refresh",
                     }
-                    write_json(baseline_file, refreshed_baseline)
+                    # Write refreshed baseline as artifact pyramid
+                    _next_baseline_dir = os.path.join(os.path.dirname(val_dir), "baseline", f"epoch-{next_epoch}")
+                    os.makedirs(os.path.join(_next_baseline_dir, "01-summary"), exist_ok=True)
+                    os.makedirs(os.path.join(_next_baseline_dir, "02-analysis"), exist_ok=True)
+                    os.makedirs(os.path.join(_next_baseline_dir, "03-dossiers"), exist_ok=True)
+                    _new_summary = os.path.join(_next_baseline_dir, "01-summary", "findings.md")
+                    _new_analysis = os.path.join(_next_baseline_dir, "02-analysis", "per-task-evaluation.md")
+                    _new_dossiers = os.path.join(_next_baseline_dir, "03-dossiers")
+                    _new_index = os.path.join(_next_baseline_dir, "00-index.md")
+                    _created = refreshed_baseline_json["created_at"]
+                    with open(_new_summary, "w", encoding="utf-8") as f:
+                        f.write(f"""---
+epoch: {next_epoch}
+pass_rate: {pm['pass_rate']}
+tasks_passed: {pm['tasks_passed']}
+tasks_failed: {pm['tasks_failed']}
+total_tasks: {len(val_tasks)}
+avg_quality_score: {pm['avg_quality_score']}
+avg_duration_seconds: {pm['avg_duration_seconds']}
+total_duration_seconds: {pm['total_duration_seconds']}
+avg_token_estimate: {pm['avg_token_estimate']}
+total_token_estimate: {pm['total_token_estimate']}
+speed_score: {pm['speed_score']}
+token_efficiency: {pm['token_efficiency']}
+weighted_score: {pm['weighted_score']}
+validation_context: {VALIDATION_CONTEXT}
+metric_weights: {json.dumps(weights)}
+target: {target}
+created_at: {_created}
+source: post_merge_refresh
+---
+
+# Baseline Validation — Epoch {next_epoch} (Post-Merge Refresh)
+
+**Baseline pass rate:** {pm['tasks_passed']}/{len(val_tasks)} ({float(pm['pass_rate']):.0%})
+**Weighted score:** {float(pm['weighted_score']):.4f}
+
+Post-merge cumulative validation passed. Baseline refreshed.
+
+## SOURCES (LAYER 2 NAVIGATION)
+02-analysis/per-task-evaluation.md
+ -> Per-task post-merge validation results
+""")
+                    with open(_new_analysis, "w", encoding="utf-8") as f:
+                        lines = [f"# Per-Task Post-Merge Validation — Epoch {next_epoch}\n"]
+                        for d in detail_records:
+                            tid = d.get("task_id", "unknown")
+                            r = d.get("result", {})
+                            st = "PASS" if r.get("pass", False) else "FAIL"
+                            lines.append(f"## Task: {tid}")
+                            lines.append(f"**Status:** {st} | **Quality:** {r.get('quality_score', 0.0)}")
+                            lines.append(f"**Reason:** {r.get('reason', '')}\n")
+                        for d in detail_records:
+                            tid = d.get("task_id", "unknown")
+                            lines.append(f"03-dossiers/task-{tid}.json")
+                            lines.append(f" -> Raw output for task {tid}\n")
+                        f.write("\n".join(lines))
+                    for d in detail_records:
+                        d_path = os.path.join(_new_dossiers, f"task-{d['task_id']}.json")
+                        write_json(d_path, d)
+                    with open(_new_index, "w", encoding="utf-8") as f:
+                        f.write(f"""# Baseline Validation Cache — Epoch {next_epoch} (Post-Merge Refresh)
+
+Refreshed baseline after epoch {epoch} merge.
+
+## Navigation
+
+- [01-summary/findings.md](01-summary/findings.md) — L1: post-merge baseline metrics
+- [02-analysis/per-task-evaluation.md](02-analysis/per-task-evaluation.md) — L2: per-task validation results
+- [03-dossiers/](03-dossiers/) — L3: raw validation output per task
+
+## Provenance
+
+- **epoch:** {next_epoch}
+- **refreshed_from_epoch:** {epoch}
+- **source:** post_merge_refresh
+- **generated_at:** {_created}
+""")
+                    # Also write JSON snapshot for tool compatibility
+                    write_json(os.path.join(_next_baseline_dir, "baseline.json"), refreshed_baseline_json)
                     print(f"  ✓ Post-merge validation passed: pass {bpr:.0%}→{mpr:.0%}, "
                           f"score {bsc:.2f}→{msc:.2f}")
-                    print(f"  Baseline refreshed: {baseline_file} "
+                    print(f"  Baseline refreshed: {_new_index} "
                           f"(pass: {mpr:.0%}, quality: {pm['avg_quality_score']:.2f}, "
                           f"score: {msc:.2f})")
 
@@ -1677,6 +1901,13 @@ rec = data.get('recommendation', 'unknown')
 print(f'  Meta-reflection written: $reflect_dir/slow-meta-epoch-$EPOCH.json')
 print(f'  Recommendation: {rec}')
 "
+        # Copy slow-meta to unified pyramid and regenerate root files
+        cp "$reflect_dir/slow-meta-epoch-$EPOCH.json" "$STATE_DIR/03-dossiers/epoch-$EPOCH-slowmeta.json"
+        SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)" PYTHONPATH="$SCRIPTS_DIR:$PYTHONPATH" \
+            EPOCH="$EPOCH" STATE_DIR="$STATE_DIR" python3 << 'PYEOF'
+import os, sys; import pyramid_utils
+pyramid_utils.update_root_pyramid(os.environ["STATE_DIR"], os.environ["EPOCH"])
+PYEOF
     else
         echo "To run slow-meta, use --exec or:"
         echo "  Review the rejected-edit buffer at $buffer_file"

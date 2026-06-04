@@ -80,6 +80,17 @@ def _expected_success_token_estimate(
     )
 
 
+# And the pre-fix formula (for the negative assertion in the
+# test_success_path_excludes_stderr_token_estimate_under_bug case — kept
+# here so the expected values are obviously derived).
+def _buggy_success_token_estimate(
+    prompt: str, merged_skill: str, stdout: str, stderr: str
+) -> int:
+    return int(
+        (len(prompt) + len(merged_skill) + len(stdout or "") + 3) // 4
+    )
+
+
 class _FunctionSandbox:
     """Builds a controlled namespace and exec's run_post_merge_task into it."""
 
